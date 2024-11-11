@@ -1,0 +1,141 @@
+First, how did I approach getting access to the data from the provided JSON files?
+This was pretty simple. I signed up for a free trial of Snowflake, then imported the 3 tables into a schema.
+All data exploration and SQL queries in this output are in Snowflake SQL syntax
+
+Question 1:
+Develop a relational diagram and label the fields and keys.
+The output for this is located at the below link in a Google Sheet:
+https://docs.google.com/spreadsheets/d/1nxppY9fjBrv3Xk4u3hp9VDDktsG4RwJEzGtn0mT3u04/edit?gid=0#gid=0
+
+What I've done here is first, in Snowflake I wrote some SQL that describes the table columns and column data types. This helped immensely to visualize how much data I had, and what the data actually looked like.
+First glance, I noticed that much of the core data needed to answer all questions on the assessment were in JSON. I wrote some simple CTEs that gave me a clean data output. 
+Here is the query that gives me access to quantify the data for the assessment questions. As noted, this data was not at all clean, and pretty much everything had to be parsed/cleaned.
+
+with flattened_receipt_data as (
+
+  SELECT 
+    _id,
+    userid as user_id,
+    replace(replace(split_part(_id,'oid":"',2),'"',''),'}','')::string as receipt_id,
+    value:barcode::STRING AS barcode,
+    value:brandCode::STRING AS brandcode,
+    value:finalPrice::STRING AS items_price,
+    value:quantityPurchased::STRING AS item_quantity,
+    rewardsReceiptStatus::STRING AS reward_receipt_status,
+    rewardsreceiptitemlist
+  FROM FETCH_DATA.PUBLIC.FETCH_DATA_RECEIPTS,
+    LATERAL FLATTEN(input => PARSE_JSON(rewardsreceiptitemlist))
+)
+,
+
+cleaned_user_data as (
+
+  select
+    PARSE_JSON(_id):"$oid"::STRING as user_id,
+    TO_TIMESTAMP_LTZ(PARSE_JSON(createddate):"$date"::NUMBER / 1000) as created_date,
+    TO_TIMESTAMP_LTZ(PARSE_JSON(lastlogin):"$date"::NUMBER / 1000) as last_login,
+    u.role,
+    u.signupsource,
+    u.state,
+    u.active
+  from FETCH_DATA.PUBLIC.FETCH_USER u
+  qualify row_number() over (partition by user_id order by created_date desc) = 1
+  --needed to deduplicate user rows here
+
+)
+,
+
+final_clean_data as (
+
+  select
+    fl.*,
+    u.*,
+    br.*
+  from flattened_receipt_data fl 
+  left join cleaned_user_data u 
+    on fl.user_id = u.user_id
+  left join FETCH_DATA.PUBLIC.FETCH_BRANDS br 
+    on fl.brandcode = br.brandcode
+)
+
+select
+  *
+from final_clean_data
+
+
+
+
+Question 2:
+Write queries which for two of the listed questions.
+When I was exploring the data I found that data for BRAND, according to the RECEIPTS data (brandCode field), looked pretty sparse and not helpful. Looks like out of about 7k Items in the flattened receipts table, only ~2900 items had Brand data
+So, I opted to skip the brand-related questions and did options 3 and 4, which were quantifiable regardless of Brand. Here they are:
+
+When considering average spend from receipts with 'rewardsReceiptStatus’ of ‘Accepted’ or ‘Rejected’, which is greater?
+--First of all, there is not "Accepted" status in that field. There are "Pending", "Flagged", "Finished", and "Rejected." So let's assume you mean "Finished" instead of "Accepted". Here is the simple query based on my final_clean_data CTE:
+
+select
+  reward_receipt_status,
+  avg(total_item_spend)
+from final_clean_data
+group by 1
+
+Average price of a Finished receipt: $81.23
+Average price of a Rejected $26.40
+
+Now for the next question:
+
+When considering total number of items purchased from receipts with 'rewardsReceiptStatus’ of ‘Accepted’ or ‘Rejected’, which is greater?
+
+Average number of items in an Accepted (Finished) order: 15.85
+Average number of items in a Rejected order: 2.2
+
+
+
+Question 3:
+Data integrity problems
+Found a bunch of issues during the exploration phase:
+- Biggest glaring problem was duplicate users with the same ID in the USER table. I deduped this in the data by doing a window function, on most recent created date, even though Created Dates looked to be mostly the same for each user. Just duplicate records with no VALID_TO dates
+- There's inconsistency in the structure of the most important JSON field "rewardsreceiptitemlist" in RECEIPTS. This makes it difficult to parse fields based on the order of the object fields in the JSON
+- Many Brandcodes listed in the RECEIPTS table weren't found in BRANDS table, so even if the data in RECEIPTS was more prolific, the quantifiable outputs on Brand would be poor
+- Barcodes in BRANDS didn't match barcodes in RECEIPTS. Maybe I misunderstood the relationship here? Either way, the issue is missing data or the field is badly labeled
+- RECEIPTS is missing tons of metadata on items--there are many records with "Item Not Found", which is the main reason I didn't do the Brand-related questions above--there wasn't enough data to do a respectable query--would have gotten "Unknown Brand" for about 60% of the data, since there was not Brand Code listed most of the time
+- CATEGORY_CODE in BRANDS tabel isn't a code (which I assume should be some kind of Joining Key?)--it's a string. This is super poor practice. Make it a unique non-descriptive key or a number, something other than this description
+- Why is the TOPBRAND field in BRANDS not populating data? It should have either a TRUE if the field is 1, or FALSE--but not null
+
+
+
+
+Question 4:
+Sample email to stakeholder:
+
+Hi Robert,
+
+Following our meeting last week, the data team was able to complete a preliminary exploration of the new purchase data, and create some simple models that will help quantify some of the data you requested. We should be able to 
+get the data in production, and into a BI tool for exploration next week, but there are some big caveats here.
+
+Our meeting discussion was focused on getting insights about Brand purchases. You were also interested in knowing sales quantities and purchase amounts around different segments of users (All users, new users 6 months), as well as some
+time-series data on how recent purchases are performing compared to prior months. The good news is, we appear to have all this data. The bad news is, we found some pretty bad data integrity problems, which would limit the 
+amount of insight you could gain right away from this data. 
+
+For example, in our sample dataset, we had about 7000 items purchased. It looks like the transaction system is only relaying Brand info for about 42% of purchases. With that low quality, it would be a mistake to proceed
+with any decision-making around Brands and marketing, until the data is in a better state. To reiterate, the issue is in the raw data, so we would need to work with engineering to discover the issues underlying the missing data. 
+I have a list of data integrity issues I discovered, and I would like a chance to dive into them and resolve before pushing any data out to you and other stakeholders. I'll reach out to the engineering manager and start some 
+conversations around these issues, first to determine what it is we're seeing (is it really an issue?) or if this is something I've misunderstood. It's possible I've just misunderstood what I'm seeing, but I'll get some answers 
+this week, and get back to you by Friday.
+
+Overall, it looks like this project should be pretty simple; we just need to solve the data quality issues. I'll keep you updated on progress.
+
+Thanks,
+
+Jeremiah
+
+
+
+
+
+
+
+
+
+
+
